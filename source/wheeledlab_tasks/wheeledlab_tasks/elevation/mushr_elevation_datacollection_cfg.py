@@ -2,6 +2,19 @@
 Configuration for MuSHR elevation data collection.
 Randomly controls robots through terrain to collect state-action trajectories
 for training dynamics models.
+
+Changes from original:
+- reset_robot_position now spawns robots with forward velocity 1.0-3.0 m/s,
+  so they have momentum to hit ramps instead of starting from standstill.
+- episode_length_s raised from 10 to 20 to give robots more time to find ramps.
+- stuck.wheel_spin_thr raised from 5.0 to 15.0 to prevent false resets during
+  slow heavy turns with spinning wheels.
+
+Explicitly NOT changed:
+- forward_vel clamp stays at 1.2. It's only used as an observation for the
+  `stuck` termination check (compared against min_vel=0.02), so the clamp
+  has no effect on physics or speed. Changing it is a red herring.
+- action scale stays at (3.0, 0.488). Throttle is already scaled to +/-3 m/s.
 """
 
 import torch
@@ -33,6 +46,7 @@ from wheeledlab.envs.mdp.observations import root_euler_xyz
 from wheeledlab_assets.mushr import MUSHR_SUS_CFG
 from wheeledlab_tasks.common import Mushr4WDActionCfg
 
+
 # ##########################
 # ###### OBSERVATIONS ######
 # ##########################
@@ -48,29 +62,29 @@ def world_height_map(env, sensor_cfg: SceneEntityCfg, offset: int, plane_init_va
 @configclass
 class DataCollectionObsCfg:
     """Observation specification for data collection - includes full state information."""
-    
+
     @configclass
     class FullStateObs(ObsGroup):
         """Full state observations for dynamics model training."""
-        
+
         # Position and orientation
         root_pos_w = ObsTerm(func=mdp.root_pos_w)
         root_quat_w = ObsTerm(func=mdp.root_quat_w)
         world_euler_xyz = ObsTerm(func=root_euler_xyz)
-        
+
         # Velocities
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
         root_lin_vel_w = ObsTerm(func=mdp.root_lin_vel_w)
         root_ang_vel_w = ObsTerm(func=mdp.root_ang_vel_w)
-        
+
         # Actions (controls)
         last_action = ObsTerm(func=mdp.last_action)
-        
-        # Joint states (wheel velocities, suspension positions)
+
+        # Joint states
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
         joint_vel = ObsTerm(func=mdp.joint_vel_rel)
-        
+
         # Terrain information
         elevation_map = ObsTerm(
             func=world_height_map,
@@ -95,7 +109,7 @@ class DataCollectionObsCfg:
 @configclass
 class DataCollectionTerrainImporterCfg(TerrainImporterCfg):
     """Terrain configuration for data collection."""
-    
+
     height = 0.25
     prim_path = "/World/elevation"
     terrain_type = "usd"
@@ -113,9 +127,9 @@ class DataCollectionTerrainImporterCfg(TerrainImporterCfg):
 @configclass
 class DataCollectionSceneCfg(InteractiveSceneCfg):
     """Scene configuration for data collection."""
-    
+
     terrain = DataCollectionTerrainImporterCfg()
-    
+
     light = AssetBaseCfg(
         prim_path="/World/light",
         spawn=sim_utils.DistantLightCfg(color=(0.75, 0.75, 0.75), intensity=3000.0),
@@ -148,7 +162,6 @@ class DataCollectionSceneCfg(InteractiveSceneCfg):
     )
 
     def __post_init__(self):
-        """Post initialization."""
         super().__post_init__()
         self.robot.init_state = self.robot.init_state.replace(
             pos=(0.0, 0.0, self.terrain.height)
@@ -160,7 +173,12 @@ class DataCollectionSceneCfg(InteractiveSceneCfg):
 ##########################
 
 def forward_vel(env):
-    """Get forward velocity."""
+    """Get forward velocity.
+
+    NOTE: clamp at 1.2 is intentional — this is only used by the `stuck`
+    check which compares against min_vel=0.02. Clamping doesn't affect
+    the physics or the actual achievable speed (throttle scale is 3.0 m/s).
+    """
     lin_vel = mdp.base_lin_vel(env)
     return torch.clamp(lin_vel[..., 0], max=1.2)
 
@@ -199,27 +217,27 @@ def stuck(env, min_vel, wheel_spin_thr):
 
 @configclass
 class DataCollectionTerminationsCfg:
-    """Termination terms for data collection - same as training but no goal."""
-    
-    # (1) Time out
+    """Termination terms for data collection."""
+
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
-    
-    # (2) Robot fell below terrain
+
     cart_out_of_bounds = DoneTerm(
         func=mdp.root_height_below_minimum,
         params={"minimum_height": 0.15},
     )
-    
-    # (3) Robot stuck
+
+    # CHANGED: raised wheel_spin_thr from 5.0 to 15.0 so that brief high-spin
+    # events during hard turns or landing from jumps don't trigger false
+    # "stuck" resets. Genuinely stuck robots will still trip this threshold
+    # because their wheels will spin continuously, not briefly.
     stuck = DoneTerm(
         func=stuck,
         params={
             "min_vel": 0.02,
-            "wheel_spin_thr": 5.,
+            "wheel_spin_thr": 15.0,
         },
     )
-    
-    # (4) Robot rolled over
+
     rollover = DoneTerm(
         func=upright_bool,
         params={"thresh_deg": 60.},
@@ -234,12 +252,11 @@ class DataCollectionTerminationsCfg:
 class DataCollectionEventsCfg:
     """Configuration for data collection events."""
 
-    # Startup events - randomize physical properties for diversity
     change_wheel_friction = EventTerm(
         func=mdp.randomize_rigid_body_material,
         mode="startup",
         params={
-            "static_friction_range": (1.5, 2.5),  # More variation for data diversity
+            "static_friction_range": (1.5, 2.5),
             "dynamic_friction_range": (0.8, 1.2),
             "restitution_range": (0.0, 0.1),
             "num_buckets": 10,
@@ -252,23 +269,27 @@ class DataCollectionEventsCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=["base_link"]),
-            "mass_distribution_params": (0.0, 0.8),  # More variation
+            "mass_distribution_params": (0.0, 0.8),
             "operation": "add",
         },
     )
 
-    # Reset event - randomize spawn location
+    # CHANGED: spawn with forward velocity 1.0-3.0 m/s instead of near-zero.
+    # This gives the robot momentum to hit ramps without needing to spend
+    # several seconds accelerating from standstill. Since yaw is randomized
+    # (-pi, pi), "forward" direction varies across envs, giving good coverage
+    # of the terrain.
     reset_robot_position = EventTerm(
         func=mdp.reset_root_state_uniform,
         mode="reset",
         params={
             "pose_range": {
-                "x": (-19., 19.), 
-                "y": (-19., 19.), 
+                "x": (-19., 19.),
+                "y": (-19., 19.),
                 "yaw": (-3.14, 3.14)
             },
             "velocity_range": {
-                "x": (-0.2, 0.2),
+                "x": (1.0, 3.0),   # CHANGED: was (-0.2, 0.2)
                 "y": (-0.2, 0.2),
                 "z": (0.0, 0.0),
                 "roll": (0.0, 0.0),
@@ -285,10 +306,7 @@ class DataCollectionEventsCfg:
 
 @configclass
 class RandomActionCfg(Mushr4WDActionCfg):
-    """
-    Random action configuration for data collection.
-    Actions will be randomly sampled instead of from a policy.
-    """
+    """Random action configuration for data collection."""
     pass
 
 
@@ -298,62 +316,47 @@ class RandomActionCfg(Mushr4WDActionCfg):
 
 @configclass
 class MushrElevationDataCollectionEnvCfg(ManagerBasedRLEnvCfg):
-    """
-    Configuration for MuSHR elevation data collection environment.
-    
-    This environment is designed for collecting state-action-next_state trajectories
-    for training dynamics models. Robots execute random control commands and their
-    full state trajectories are recorded.
-    
-    Note: Uses ManagerBasedRLEnvCfg for proper termination support.
-    """
+    """Configuration for MuSHR elevation data collection environment."""
 
     seed: int = 42
     num_envs: int = 512
     env_spacing: float = 0.
 
-    # Observations include full state information
     observations: DataCollectionObsCfg = DataCollectionObsCfg()
-    
-    # Actions (will be randomly sampled)
     actions: RandomActionCfg = RandomActionCfg()
-
-    # MDP settings
     events: DataCollectionEventsCfg = DataCollectionEventsCfg()
     terminations: DataCollectionTerminationsCfg = DataCollectionTerminationsCfg()
-    
-    # Rewards not needed but required for RL environment
     rewards = None
 
     def __post_init__(self):
         super().__post_init__()
-        
-        # Viewer settings
+
         self.viewer.eye = [20., -20.0, 20.0]
         self.viewer.lookat = [0.0, 0.0, 0.]
 
-        # Simulation settings
-        self.sim.dt = 0.01  # 100 Hz physics
-        self.decimation = 10  # 10 Hz control
+        self.sim.dt = 0.01          # 100 Hz physics
+        self.decimation = 10        # 10 Hz control
         self.sim.render_interval = self.decimation
-        
-        # Episode length for data collection (longer episodes = more data per trajectory)
-        self.episode_length_s = 10  # 10 seconds per episode
+
+        # CHANGED: 10 -> 20 seconds. With action persistence of 1-2.5s,
+        # 10s only gives 4-10 distinct action segments per episode. 20s
+        # doubles that and gives the robot more chances to encounter a ramp.
+        self.episode_length_s = 20
 
         # Action scaling: (throttle_scale, steering_scale)
+        # Throttle +/- 3.0 m/s, steering +/- 0.488 rad (~28 deg).
+        # These match the MuSHR hardware limits — don't change unless the
+        # real robot can go faster/steer sharper.
         self.actions.throttle_steer.scale = (3.0, 0.488)
 
-        # Create scene
         self.scene = DataCollectionSceneCfg(
-            num_envs=self.num_envs, 
+            num_envs=self.num_envs,
             env_spacing=self.env_spacing,
         )
 
 
 @configclass
 class MushrElevationDataCollectionPlayEnvCfg(MushrElevationDataCollectionEnvCfg):
-    """
-    Play/visualization config for data collection - fewer environments for easier viewing.
-    """
+    """Play/visualization config - fewer environments for easier viewing."""
     num_envs: int = 16
-    episode_length_s: float = 10.0  # Longer episodes for observation
+    episode_length_s: float = 20.0  # CHANGED: match main config
