@@ -79,14 +79,14 @@ def main():
     simulation_app = app_launcher.app
 
     # Import after launching (required for IsaacLab)
-    # from wheeledlab_tasks.elevation.mushr_elevation_datacollection_cfg import (
-    #     MushrElevationDataCollectionEnvCfg
-    # )
-    # from isaaclab.envs import ManagerBasedRLEnv
-    from wheeledlab_tasks.elevation.single_ramp_cfg import (
-        SingleRampDataCollectionEnvCfg
+    from wheeledlab_tasks.elevation.mushr_elevation_datacollection_cfg import (
+        MushrElevationDataCollectionEnvCfg
     )
-    env_cfg = SingleRampDataCollectionEnvCfg()
+    from isaaclab.envs import ManagerBasedRLEnv
+    # from wheeledlab_tasks.elevation.single_ramp_cfg import (
+    #    SingleRampDataCollectionEnvCfg
+    # )
+    # env_cfg = SingleRampDataCollectionEnvCfg()
     
     # Create output directory
     output_dir = Path(args.output_dir)

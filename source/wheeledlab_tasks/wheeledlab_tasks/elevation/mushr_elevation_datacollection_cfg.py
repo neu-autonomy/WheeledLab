@@ -284,17 +284,17 @@ class DataCollectionEventsCfg:
         mode="reset",
         params={
             "pose_range": {
-                "x": (-19., 19.),
-                "y": (-19., 19.),
-                "yaw": (-3.14, 3.14)
+                "x": (18, 18),
+                "y": (10.0, 12.0),
+                "yaw": (1.47, 1.67),
             },
             "velocity_range": {
-                "x": (1.0, 3.0),   # CHANGED: was (-0.2, 0.2)
-                "y": (-0.2, 0.2),
+                "x": (-0.2, 0.2),
+                "y": (11.5, 12.5),
                 "z": (0.0, 0.0),
                 "roll": (0.0, 0.0),
                 "pitch": (0.0, 0.0),
-                "yaw": (-0.5, 0.5),
+                "yaw": (-0.2, 0.2),
             },
         }
     )
@@ -347,7 +347,7 @@ class MushrElevationDataCollectionEnvCfg(ManagerBasedRLEnvCfg):
         # Throttle +/- 3.0 m/s, steering +/- 0.488 rad (~28 deg).
         # These match the MuSHR hardware limits — don't change unless the
         # real robot can go faster/steer sharper.
-        self.actions.throttle_steer.scale = (3.0, 0.488)
+        self.actions.throttle_steer.scale = (3.0, 0.0)
 
         self.scene = DataCollectionSceneCfg(
             num_envs=self.num_envs,
