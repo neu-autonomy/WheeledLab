@@ -37,16 +37,19 @@ from isaaclab.app import AppLauncher
 
 
 def sample_actions(num_envs, action_dim, device):
-    """Sample a batch of actions with asymmetric distributions.
+    """Sample a batch of actions biased for kicker jumps.
 
-    - throttle (dim 0): Beta(0.3, 0.3) -> U-shaped, biases to full-forward/full-reverse
-    - steering (dim 1+): Beta(2, 2)    -> bell-shaped around 0, occasional sharp turns
-
-    Both are rescaled from [0, 1] to [-1, 1].
+    - throttle (dim 0): Beta(4, 1.5) on [0, 1] -> biased to HIGH FORWARD throttle so the
+      robot commits to the ramp. Reverse is disabled in the action cfg (no_reverse=True),
+      so sampling negative throttle just wasted half the distribution before — we now
+      sample only the forward half.
+    - steering (dim 1+): Beta(2, 2) rescaled to [-1, 1] -> bell-shaped around 0, mostly
+      gentle so the robot still hits the ramp, but steering is LIVE (scale 0.488) so the
+      dynamics model actually sees steering affect the next state.
     """
-    # Throttle: aggressive, commits to extremes
-    throttle_dist = torch.distributions.Beta(0.3, 0.3)
-    throttle = throttle_dist.sample((num_envs, 1)).to(device) * 2.0 - 1.0
+    # Throttle: forward, biased high (commit to the ramp)
+    throttle_dist = torch.distributions.Beta(4.0, 1.5)
+    throttle = throttle_dist.sample((num_envs, 1)).to(device)  # [0, 1], forward only
 
     # Steering: mostly mild, occasionally sharp
     steering_dist = torch.distributions.Beta(2.0, 2.0)
@@ -63,7 +66,12 @@ def main():
     parser.add_argument("--num_envs", type=int, default=512, help="Number of parallel environments")
     parser.add_argument("--num_episodes", type=int, default=10, help="Number of episodes to collect per environment")
     parser.add_argument("--output_dir", type=str, default="./data/dynamics", help="Output directory for data")
-    parser.add_argument("--episode_length", type=float, default=10.0, help="Episode length in seconds")
+    parser.add_argument("--episode_length", type=float, default=None,
+                        help="Episode length in seconds. If unset, use the env config's value "
+                             "(kicker = 2.0s). Pass a value only to override the config.")
+    parser.add_argument("--env", type=str, default="kicker", choices=["kicker", "terrain"],
+                        help="Which collection env: 'kicker' (per-env steep ramp, reachable jumps) "
+                             "or 'terrain' (old full-terrain config)")
     # NEW: action persistence controls
     parser.add_argument("--min_hold_steps", type=int, default=10,
                         help="Minimum control steps to hold an action (10 steps = 1.0s at 10Hz)")
@@ -79,15 +87,16 @@ def main():
     simulation_app = app_launcher.app
 
     # Import after launching (required for IsaacLab)
-    from wheeledlab_tasks.elevation.mushr_elevation_datacollection_cfg import (
-        MushrElevationDataCollectionEnvCfg
-    )
     from isaaclab.envs import ManagerBasedRLEnv
-    # from wheeledlab_tasks.elevation.single_ramp_cfg import (
-    #    SingleRampDataCollectionEnvCfg
-    # )
-    # env_cfg = SingleRampDataCollectionEnvCfg()
-    
+    if args.env == "kicker":
+        from wheeledlab_tasks.elevation.kicker_ramp_cfg import (
+            KickerRampDataCollectionEnvCfg as EnvCfg
+        )
+    else:
+        from wheeledlab_tasks.elevation.mushr_elevation_datacollection_cfg import (
+            MushrElevationDataCollectionEnvCfg as EnvCfg
+        )
+
     # Create output directory
     output_dir = Path(args.output_dir)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -99,18 +108,29 @@ def main():
     print(f"{'='*80}")
     print(f"Number of environments: {args.num_envs}")
     print(f"Episodes per environment: {args.num_episodes}")
-    print(f"Episode length: {args.episode_length}s")
+    print(f"Episode length: {args.episode_length if args.episode_length is not None else 'from config'}s")
     print(f"Action hold steps: [{args.min_hold_steps}, {args.max_hold_steps}] "
           f"({args.min_hold_steps*0.1:.1f}s - {args.max_hold_steps*0.1:.1f}s)")
     print(f"Output directory: {run_dir}")
     print(f"{'='*80}\n")
 
     # Create environment configuration
-    env_cfg = MushrElevationDataCollectionEnvCfg()
+    env_cfg = EnvCfg()
     env_cfg.num_envs = args.num_envs
-    env_cfg.episode_length_s = args.episode_length
+    # Only override the config's episode length if the user explicitly passed one.
+    # (Previously this always overwrote it with the CLI default, silently ignoring the
+    # config -- which is why 4.0s ran even when the config said 2.0s.)
+    if args.episode_length is not None:
+        env_cfg.episode_length_s = args.episode_length
     # Update scene config to match num_envs (since __post_init__ was already called with defaults)
     env_cfg.scene.num_envs = args.num_envs
+
+    # Kicker env: one generated sub-terrain (kicker) per env so no two robots share a
+    # spawn origin. __post_init__ ran with the default num_envs, so re-set num_cols here
+    # now that the real num_envs is known.
+    if args.env == "kicker":
+        env_cfg.scene.terrain.terrain_generator.num_rows = 1
+        env_cfg.scene.terrain.terrain_generator.num_cols = args.num_envs
 
     # Create environment (using ManagerBasedRLEnv for proper termination support)
     env = ManagerBasedRLEnv(cfg=env_cfg)
@@ -120,7 +140,7 @@ def main():
     action_dim = env.action_manager.total_action_dim
     print(f"Total observation dimension: {obs_dim}")
     print(f"Action dimension: {action_dim}")
-    print(f"Note: Observations include full state + elevation map (last 625 values)")
+    print(f"Note: Observations include full state + elevation map (last 676 values = 26x26)")
 
     # Data storage buffers
     episode_data = {
@@ -272,12 +292,21 @@ def save_data(episode_data, output_dir, file_counter, env_cfg):
         f.create_dataset('terminated', data=terminated, compression='gzip')
         f.create_dataset('truncated', data=truncated, compression='gzip')
 
+        # Elevation map size is DERIVED from the height scanner pattern so it can never
+        # drift from reality again. A GridPatternCfg of size L, resolution r yields
+        # floor(L/r)+1 points per axis (endpoints included): 2.5/0.1+1 = 26 -> 26x26 = 676.
+        # (The old hardcoded 625/25x25 was WRONG and silently misaligned every consumer.)
+        pat = env_cfg.scene.height_scanner.pattern_cfg
+        grid_x = int(round(pat.size[0] / pat.resolution)) + 1
+        grid_y = int(round(pat.size[1] / pat.resolution)) + 1
+        elev_size = grid_x * grid_y
+
         f.attrs['num_samples'] = len(states)
         f.attrs['state_dim'] = states.shape[1]
         f.attrs['action_dim'] = actions.shape[1]
-        f.attrs['elevation_map_size'] = 625
-        f.attrs['elevation_map_grid_size'] = 25
-        f.attrs['elevation_map_location'] = 'last_625_values'
+        f.attrs['elevation_map_size'] = elev_size
+        f.attrs['elevation_map_grid_size'] = grid_x   # = grid_y (square pattern)
+        f.attrs['elevation_map_location'] = f'last_{elev_size}_values'
         f.attrs['action_0_name'] = 'throttle'
         f.attrs['action_1_name'] = 'steering'
         f.attrs['action_0_scale'] = 3.0
@@ -291,7 +320,8 @@ def save_data(episode_data, output_dir, file_counter, env_cfg):
         f.attrs['control_dt'] = env_cfg.sim.dt * env_cfg.decimation
 
     print(f"Saved {len(states)} samples to {output_file}")
-    print(f"  - State dim: {states.shape[1]} (includes 625-value elevation map at end)")
+    print(f"  - State dim: {states.shape[1]} (includes {elev_size}-value "
+          f"{grid_x}x{grid_y} elevation map at end)")
     print(f"  - Action dim: {actions.shape[1]} (throttle, steering)")
 
 

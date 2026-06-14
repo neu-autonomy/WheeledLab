@@ -20,13 +20,15 @@ def parse_state_vector(states):
     - last_action: [2] (throttle, steering)
     - joint_pos: [N] joint positions
     - joint_vel: [N] joint velocities
-    - elevation_map: [625] heightmap (LAST 625 values)
+    - elevation_map: [676] heightmap (LAST 676 values = 26x26)
     """
-    # Extract elevation map (always last 625 values)
-    elevation_maps = states[:, -625:].reshape(-1, 25, 25)
-    
+    # Extract elevation map (always last 676 values = 26x26 grid).
+    # NOT 625/25x25 -- GridPatternCfg(size=2.5, res=0.1) -> 26 points/axis. Verified
+    # against the data; the 625 slice misaligns every grid row.
+    elevation_maps = states[:, -676:].reshape(-1, 26, 26)
+
     # Extract core state (everything except elevation map)
-    core_states = states[:, :-625]
+    core_states = states[:, :-676]
     
     # Parse components
     idx = 0

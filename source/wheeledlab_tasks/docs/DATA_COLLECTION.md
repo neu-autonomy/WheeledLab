@@ -7,15 +7,45 @@ This guide explains how to collect dynamics data from the MuSHR robot navigating
 The data collection system runs 512 parallel robot simulations with random control inputs, recording full state trajectories including:
 - Robot pose and velocities
 - Joint states (wheels, suspension)
-- Elevation maps (25×25 heightmap grid)
+- Elevation maps (26×26 heightmap grid)
 - Actions (throttle, steering)
 - Termination flags (rollover, stuck, out-of-bounds, timeout)
 
 ## Files
 
-- **Configuration**: `wheeledlab_tasks/elevation/mushr_elevation_datacollection_cfg.py`
+- **Kicker-ramp config (recommended for jump data)**: `wheeledlab_tasks/elevation/kicker_ramp_cfg.py`
+- **Full-terrain config**: `wheeledlab_tasks/elevation/mushr_elevation_datacollection_cfg.py`
 - **Collection Script**: `scripts/collect_dynamics_data.py`
+- **Dataset inspection**: `scripts/inspect_dynamics_data.py`
 - **This Guide**: `docs/DATA_COLLECTION.md`
+
+## Collecting reachable jump data (kicker env)
+
+The MuSHR tops out at **3 m/s (hardware limit)**, which is too slow to clear a gentle
+ramp — so jumps must come from ramp *geometry*, not from spawning the robot at an
+unreachable speed. The `kicker` env gives every parallel environment its own short,
+steep ramp (~28–42°, randomized) on flat ground, spawns the robot ~2 m before it at a
+reachable 2.5–3.0 m/s facing the ramp, and keeps steering live. Each episode is a jump
+attempt. Rollover/stuck terminations are disabled so the full takeoff→airborne→landing
+arc is recorded.
+
+```bash
+# Collect jump data (default env is now 'kicker')
+python scripts/collect_dynamics_data.py --num_envs 512 --num_episodes 50 --headless
+
+# Watch a few of them jump
+python scripts/collect_dynamics_data.py --env kicker --num_envs 8 --num_episodes 3 --enable_cameras
+
+# Old full-terrain behavior (general driving, not jump-focused)
+python scripts/collect_dynamics_data.py --env terrain --num_envs 512 --num_episodes 10 --headless
+
+# Verify the dataset: NaNs, speeds (<=3), airborne fraction, steering effect, action ranges
+python scripts/inspect_dynamics_data.py            # newest run under ./data/dynamics
+```
+
+To change the jump, edit the `KICKER_*` constants at the top of `kicker_ramp_cfg.py`
+(angle range, ramp length, spawn speed). Shorter + steeper = more air, up to the point
+the ramp is shorter than the wheelbase (~0.33 m) and the robot can't climb it.
 
 ## Quick Start
 
@@ -100,11 +130,17 @@ Each HDF5 file contains:
 #### Metadata Attributes
 
 - `num_samples`: Total number of transitions
-- `state_dim`: State vector dimension (typically ~650)
+- `state_dim`: State vector dimension (720 = 44 core/joint + 676 elevation)
 - `action_dim`: Action vector dimension (2)
-- `elevation_map_size`: Number of elevation map points (625)
-- `elevation_map_grid_size`: Grid resolution (25×25)
-- `elevation_map_location`: Where in state vector (`"last_625_values"`)
+- `elevation_map_size`: Number of elevation map points (**676**)
+- `elevation_map_grid_size`: Grid resolution (**26×26**)
+- `elevation_map_location`: Where in state vector (`"last_676_values"`)
+
+> **Note:** earlier runs hardcoded these to 625 / 25×25, which is wrong. A
+> `GridPatternCfg(size=2.5, resolution=0.1)` produces `2.5/0.1 + 1 = 26` points per
+> axis (endpoints included) → **26×26 = 676**. The size is now derived from the sensor
+> config at save time, so it can't drift. If you have old files with the 625 attr, the
+> real layout is still the last 676 values — slice `states[:, -676:]`, not `-625:`.
 - `action_0_name`, `action_1_name`: Action names (`"throttle"`, `"steering"`)
 - `action_0_scale`, `action_1_scale`: Scaling factors (3.0 m/s, 0.488 rad)
 - `episode_length_s`: Episode length (10.0 seconds)
@@ -117,7 +153,7 @@ Each HDF5 file contains:
 The state vector is a concatenation of the following (in order):
 
 ```python
-# Total dimension: ~650 (depends on robot joint configuration)
+# Total dimension: 720 (24 core + 20 joint + 676 elevation)
 
 # Pose (10 values)
 root_pos_w        # [3] (x, y, z) position in world frame
@@ -137,9 +173,9 @@ last_action       # [2] (throttle, steering) from previous timestep
 joint_pos         # [N] joint positions (wheels, suspension)
 joint_vel         # [N] joint velocities
 
-# Terrain (625 values)
-elevation_map     # [625] 25×25 heightmap grid (2.5m × 2.5m, 0.1m resolution)
-                  # ALWAYS the last 625 values in the state vector
+# Terrain (676 values)
+elevation_map     # [676] 26×26 heightmap grid (2.5m × 2.5m, 0.1m resolution)
+                  # ALWAYS the last 676 values in the state vector
 ```
 
 ### Action Vector Structure
@@ -181,12 +217,12 @@ print(f"Action dimension: {action_dim}")
 ### Example: Extract Components from State
 
 ```python
-# Extract elevation map (always last 625 values)
-elevation_maps = states[:, -625:]  # Shape: (N_samples, 625)
-elevation_maps = elevation_maps.reshape(-1, 25, 25)  # Shape: (N_samples, 25, 25)
+# Extract elevation map (always last 676 values = 26x26)
+elevation_maps = states[:, -676:]  # Shape: (N_samples, 676)
+elevation_maps = elevation_maps.reshape(-1, 26, 26)  # Shape: (N_samples, 26, 26)
 
 # Extract core state (everything except elevation map)
-core_states = states[:, :-625]  # Shape: (N_samples, state_dim - 625)
+core_states = states[:, :-676]  # Shape: (N_samples, state_dim - 676)
 
 # Parse core state components
 idx = 0
